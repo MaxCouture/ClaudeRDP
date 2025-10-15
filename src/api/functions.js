@@ -135,3 +135,5 @@ export const cleanupFutureArticles = base44.functions.cleanupFutureArticles;
 
 export const updateMinisterialFunctions = base44.functions.updateMinisterialFunctions;
 
+export const sendToTeamsChannel = base44.functions.sendToTeamsChannel;
+

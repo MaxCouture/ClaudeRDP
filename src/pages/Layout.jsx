@@ -1,9 +1,8 @@
 
-
 import React from "react";
 import { Link, useLocation } from "react-router-dom";
 import { createPageUrl } from "@/utils";
-import { Newspaper, Rss, Plus, BarChart3, Settings, Tag, Landmark, Key, Archive, Users, Mail, PenSquare, Mic } from "lucide-react";
+import { Newspaper, Rss, Plus, BarChart3, Settings, Tag, Landmark, Key, Archive, Users, Mail, PenSquare, Mic, AlertTriangle } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -27,6 +26,7 @@ const navigationItems = [
   { title: "Archives", url: createPageUrl("Archives"), icon: Archive },
   { title: "Sources", url: createPageUrl("Sources"), icon: Rss },
   { title: "Catégories & Mots-clés", url: createPageUrl("CategoriesKeywords"), icon: Tag },
+  { title: "Canaux Teams", url: createPageUrl("TeamsChannels"), icon: AlertTriangle },
 ];
 
 export default function Layout({ children, currentPageName }) {
@@ -149,4 +149,3 @@ export default function Layout({ children, currentPageName }) {
     </SidebarProvider>
   );
 }
-

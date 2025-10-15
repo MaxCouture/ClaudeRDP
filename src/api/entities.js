@@ -29,6 +29,8 @@ export const Depute = base44.entities.Depute;
 
 export const DeputeFederal = base44.entities.DeputeFederal;
 
+export const TeamsChannel = base44.entities.TeamsChannel;
+
 
 
 // auth sdk:
