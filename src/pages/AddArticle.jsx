@@ -11,18 +11,11 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/components/ui/use-toast";
 import { Toaster } from "@/components/ui/toaster";
-import { Plus, ArrowLeft, Save, X } from "lucide-react";
+import { Plus, ArrowLeft, Save, X, AlertTriangle } from "lucide-react";
 import { useNavigate } from 'react-router-dom';
+import { EXCLUDED_CATEGORIES_FEED, EXCLUDED_CATEGORIES_STATS } from "../components/utils/constants";
 
-const availableCategories = [
-  "Économie", 
-  "Santé",
-  "Environnement",
-  "Éducation",
-  "Saguenay-Lac-St-Jean",
-  "Aînés"
-];
-
+// Moved from within component to global scope as it's static
 const categoryColors = {
   "Économie": "bg-green-100 text-green-800",
   "Santé": "bg-blue-100 text-blue-800",
@@ -34,6 +27,7 @@ const categoryColors = {
 
 export default function AddArticlePage() {
   const [sources, setSources] = useState([]);
+  const [availableCategories, setAvailableCategories] = useState([]); // Changed to state variable
   const [isLoading, setIsLoading] = useState(false);
   const [selectedCategories, setSelectedCategories] = useState([]);
   const navigate = useNavigate();
@@ -49,19 +43,31 @@ export default function AddArticlePage() {
   });
 
   useEffect(() => {
-    const loadSources = async () => {
+    const loadData = async () => { // Renamed from loadSources to loadData
       try {
-        const sourcesData = await Source.list();
+        const [sourcesData, categoriesData] = await Promise.all([ // Fetch sources and categories in parallel
+          Source.list(),
+          Category.list()
+        ]);
         setSources(sourcesData || []);
+
+        // Formater les catégories pour inclure la couleur et l'état d'exclusion
+        const formattedCategories = (categoriesData || []).map(cat => ({
+          value: cat.name,
+          label: cat.name,
+          color: categoryColors[cat.name] || 'bg-gray-100 text-gray-800', // Default color if not found
+          isExcluded: EXCLUDED_CATEGORIES_FEED.includes(cat.name) || EXCLUDED_CATEGORIES_STATS.includes(cat.name)
+        }));
+        setAvailableCategories(formattedCategories);
       } catch (error) {
         toast({
           title: "Erreur de chargement",
-          description: "Impossible de charger les sources.",
+          description: "Impossible de charger les sources et catégories.", // Updated description
           variant: "destructive"
         });
       }
     };
-    loadSources();
+    loadData();
   }, [toast]);
 
   const handleInputChange = (field, value) => {
@@ -85,7 +91,7 @@ export default function AddArticlePage() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    
+
     // Validation basique
     if (!formData.title.trim() || !formData.url.trim() || !formData.source_id) {
       toast({
@@ -96,9 +102,24 @@ export default function AddArticlePage() {
       return;
     }
 
+    // New validation: require at least one category
+    if (selectedCategories.length === 0) {
+      toast({
+        title: "⚠️ Aucune catégorie",
+        description: "Veuillez sélectionner au moins une catégorie pour l'article.",
+        variant: "destructive"
+      });
+      return;
+    }
+
     setIsLoading(true);
 
     try {
+      // CORRECTION: Utiliser l'heure actuelle pour garantir que l'article est "récent"
+      const now = new Date();
+      // Combine the selected date with the current time
+      const publicationDateTime = `${formData.publication_date}T${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:00Z`;
+
       // Préparer les données de l'article
       const articleData = {
         title: formData.title.trim(),
@@ -106,10 +127,12 @@ export default function AddArticlePage() {
         content: formData.content.trim() || formData.title.trim(),
         summary: formData.summary.trim() || formData.title.trim(),
         source_id: formData.source_id,
-        publication_date: formData.publication_date + "T12:00:00Z", // Midi UTC
+        publication_date: publicationDateTime, // Use the corrected publication date with current time
         categories: selectedCategories,
-        is_manually_categorized: selectedCategories.length > 0
+        is_manually_categorized: true // Explicitly set to true for manual articles
       };
+
+      console.log('📝 Création article avec données:', articleData); // Added for debugging
 
       // Créer l'article
       await Article.create(articleData);
@@ -126,6 +149,7 @@ export default function AddArticlePage() {
       }, 1500);
 
     } catch (error) {
+      console.error('Erreur création article:', error); // Added for debugging
       toast({
         title: "Erreur de création",
         description: error.message || "Impossible de créer l'article.",
@@ -135,6 +159,11 @@ export default function AddArticlePage() {
       setIsLoading(false);
     }
   };
+
+  // Vérifier si des catégories exclues sont sélectionnées pour l'alerte
+  const hasExcludedCategories = selectedCategories.some(catName =>
+    EXCLUDED_CATEGORIES_FEED.includes(catName) || EXCLUDED_CATEGORIES_STATS.includes(catName)
+  );
 
   return (
     <div className="min-h-screen p-6 bg-gray-50">
@@ -249,47 +278,72 @@ export default function AddArticlePage() {
             <div className="space-y-6">
               <Card>
                 <CardHeader>
-                  <CardTitle>Catégorisation</CardTitle>
+                  <CardTitle>Catégorisation *</CardTitle> {/* Changed title to indicate required */}
                 </CardHeader>
                 <CardContent className="space-y-4">
+                  {/* New: Warning for excluded categories */}
+                  {hasExcludedCategories && (
+                    <div className="bg-orange-50 border border-orange-200 rounded-lg p-4 flex items-start gap-3">
+                      <AlertTriangle className="w-5 h-5 text-orange-600 flex-shrink-0 mt-0.5" />
+                      <div>
+                        <p className="text-sm font-medium text-orange-900">
+                          ⚠️ Catégorie exclue du fil principal
+                        </p>
+                        <p className="text-xs text-orange-700 mt-1">
+                          Certaines catégories sélectionnées sont exclues du Dashboard. L'article sera visible seulement dans les Archives.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
                   <div>
                     <Label className="text-sm font-medium">Catégories sélectionnées</Label>
                     <div className="mt-2 flex flex-wrap gap-2 min-h-[32px] p-2 bg-gray-50 rounded-md border">
                       {selectedCategories.length === 0 ? (
                         <span className="text-gray-500 text-sm">Aucune catégorie sélectionnée</span>
                       ) : (
-                        selectedCategories.map((category) => (
-                          <Badge 
-                            key={category} 
-                            className={`${categoryColors[category] || 'bg-gray-200'} flex items-center gap-1.5 py-1 px-2`}
-                          >
-                            <span>{category}</span>
-                            <X 
-                              className="w-3.5 h-3.5 cursor-pointer hover:bg-black/20 rounded-full p-0.5" 
-                              onClick={() => removeCategory(category)}
-                            />
-                          </Badge>
-                        ))
+                        selectedCategories.map((categoryName) => {
+                          // Find the full category object to get its color and exclusion status
+                          const catInfo = availableCategories.find(c => c.value === categoryName);
+                          return (
+                            <Badge
+                              key={categoryName}
+                              className={`${catInfo?.color || 'bg-gray-200'} flex items-center gap-1.5 py-1 px-2`}
+                            >
+                              <span>{categoryName}</span>
+                              {catInfo?.isExcluded && <AlertTriangle className="w-3 h-3 text-current" />} {/* Show alert icon if excluded */}
+                              <X
+                                className="w-3.5 h-3.5 cursor-pointer hover:bg-black/20 rounded-full p-0.5"
+                                onClick={() => removeCategory(categoryName)}
+                              />
+                            </Badge>
+                          );
+                        })
                       )}
                     </div>
                   </div>
 
                   <div>
                     <Label className="text-sm font-medium mb-3 block">Sélectionner les catégories</Label>
-                    <div className="space-y-3">
+                    <div className="space-y-3 max-h-64 overflow-y-auto pr-2"> {/* Added max-height and overflow for scrolling */}
                       {availableCategories.map((category) => (
-                        <div key={category} className="flex items-center space-x-3">
+                        <div key={category.value} className="flex items-center space-x-3">
                           <Checkbox
-                            id={category}
-                            checked={selectedCategories.includes(category)}
-                            onCheckedChange={() => handleCategoryToggle(category)}
+                            id={category.value}
+                            checked={selectedCategories.includes(category.value)}
+                            onCheckedChange={() => handleCategoryToggle(category.value)}
                           />
-                          <label 
-                            htmlFor={category} 
+                          <label
+                            htmlFor={category.value}
                             className="flex items-center gap-2 cursor-pointer text-sm font-medium"
                           >
-                            <span className={`w-3 h-3 rounded-full ${categoryColors[category]?.split(' ')[0] || 'bg-gray-200'}`}></span>
-                            {category}
+                            <span className={`w-3 h-3 rounded-full ${category.color.split(' ')[0] || 'bg-gray-200'}`}></span>
+                            {category.label}
+                            {category.isExcluded && ( // Show "Exclue" badge if the category is excluded
+                              <Badge variant="outline" className="text-xs text-orange-600 border-orange-300">
+                                Exclue
+                              </Badge>
+                            )}
                           </label>
                         </div>
                       ))}
@@ -304,10 +358,11 @@ export default function AddArticlePage() {
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-3">
-                    <Button 
-                      type="submit" 
-                      disabled={isLoading || !formData.title.trim() || !formData.url.trim() || !formData.source_id}
-                      className="w-full bg-blue-600 hover:bg-blue-700" 
+                    <Button
+                      type="submit"
+                      // Disabled if loading, or missing title, url, source_id, OR no categories selected
+                      disabled={isLoading || !formData.title.trim() || !formData.url.trim() || !formData.source_id || selectedCategories.length === 0}
+                      className="w-full bg-blue-600 hover:bg-blue-700"
                       size="lg"
                     >
                       {isLoading ? (
@@ -322,10 +377,10 @@ export default function AddArticlePage() {
                         </>
                       )}
                     </Button>
-                    
-                    <Button 
-                      type="button" 
-                      variant="outline" 
+
+                    <Button
+                      type="button"
+                      variant="outline"
                       onClick={() => navigate('/Dashboard')}
                       className="w-full"
                       disabled={isLoading}
@@ -333,7 +388,7 @@ export default function AddArticlePage() {
                       Annuler
                     </Button>
                   </div>
-                  
+
                   <div className="mt-4 p-3 bg-blue-50 rounded-lg border border-blue-200">
                     <p className="text-sm text-blue-700">
                       <strong>Info :</strong> Votre article apparaîtra immédiatement dans le fil de nouvelles et pourra être inclus dans le bulletin d'information.

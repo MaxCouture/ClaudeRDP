@@ -1,17 +1,18 @@
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Article, Source, Category } from "@/api/entities";
-import { Newspaper, FileText, RefreshCw, Archive, Search, Grid, Shield, CheckCircle, XCircle, Loader2, Tag, Activity } from "lucide-react"; // Added Loader2, Tag, Activity
+import { Newspaper, FileText, RefreshCw, Archive, Search, Grid, Shield, CheckCircle, XCircle, Loader2, Tag, Activity, Clock } from "lucide-react";
+import { base44 } from "@/api/base44Client";
 import { captageComplet } from "@/api/functions/captageComplet.js";
 import { archiveAllArticles } from "@/api/functions";
 import { scrapeSitemaps } from "@/api/functions";
 import { scrapeLeQuotidien } from "@/api/functions";
 import { scrapeLeDroit } from "@/api/functions";
-import { scrapeRadioCanadaSaguenay } from "@/api/functions"; // NEW IMPORT for Radio-Canada Saguenay
+import { scrapeRadioCanadaSaguenay } from "@/api/functions";
 import { processArticleAlerts } from "@/api/functions";
-import { recategorizeALL } from "@/api/functions";
+import { recategorizeALL } from "@/api/functions"; // Keep import as it might be used elsewhere or still relevant for type hinting
 import { cleanupDuplicates } from "@/api/functions";
-import { cleanupFutureArticles } from "@/api/functions"; // NEW IMPORT for cleaning future dated articles
+import { cleanupFutureArticles } from "@/api/functions";
 import { useToast } from "@/components/ui/use-toast";
 import { Toaster } from "@/components/ui/toaster";
 import StatsCard from "../components/dashboard/StatsCard";
@@ -27,14 +28,22 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Slider } from "@/components/ui/slider";
 import { Badge } from "@/components/ui/badge";
 import { useDebounce } from "../components/hooks/useDebounce";
-
+import { handleApiError, withRetry } from "../components/utils/apiErrorHandler";
+import { validateAndSanitizeArticles } from "../components/utils/articleValidator";
+import { dashboardLogger, scanLogger } from "../components/utils/logger";
+import {
+  ARTICLE_FETCH_LIMIT,
+  EXCLUDED_CATEGORIES_STATS,
+  EXCLUDED_CATEGORIES_FEED,
+  STORAGE_KEY_SCAN_HOURS,
+  DEFAULT_DISPLAY_HOURS,
+  isArticleInTimeRange
+} from "../components/utils/constants";
 
 // Configuration windowing
 const ITEM_HEIGHT_COMPACT = 64;
 const ITEM_HEIGHT_COMFORT = 140;
 const VIEWPORT_PADDING = 6;
-const ARTICLE_FETCH_LIMIT = 2000;
-const RECENT_HOURS = 48; // ✅ SYNCHRONISÉ AVEC NEWSLETTER pour cohérence totale
 
 // Delay utility pour éviter le rate limiting
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -49,7 +58,7 @@ const OptimizedArticleCard = React.memo(({
   onSummaryUpdate,
   onGenerateAISummary,
   isGeneratingAISummary,
-  onDelete // New prop for delete functionality
+  onDelete
 }) => {
   return isCompact ? (
     <div style={{ height: ITEM_HEIGHT_COMPACT, paddingBottom: 8, boxSizing: 'border-box' }}>
@@ -62,7 +71,7 @@ const OptimizedArticleCard = React.memo(({
         onGenerateAISummary={onGenerateAISummary}
         isGeneratingAISummary={isGeneratingAISummary}
         isCompact={isCompact}
-        onDelete={onDelete} // Pass onDelete to ArticleCard
+        onDelete={onDelete}
       />
     </div>
   ) : (
@@ -75,29 +84,16 @@ const OptimizedArticleCard = React.memo(({
       onGenerateAISummary={onGenerateAISummary}
       isGeneratingAISummary={isGeneratingAISummary}
       isCompact={isCompact}
-      onDelete={onDelete} // Pass onDelete to ArticleCard
+      onDelete={onDelete}
     />
   );
 });
-
-// Constantes pour les catégories exclues des statistiques et des articles "non catégorisés"
-const EXCLUDED_CATEGORIES_FROM_STATS_AND_UNCATEGORIZED = [
-  'ConseilDesMinistres',
-  'GazetteOfficielle',
-  'Gouvernement',
-  'AssembleeNationale',
-  'Politique',
-  'Actualités',
-  'Outaouais',
-  'Sports'
-];
 
 export default function Dashboard() {
   // États principaux
   const [articlesById, setArticlesById] = useState(new Map());
   const [sources, setSources] = useState([]);
   const [categories, setCategories] = useState([]);
-  // categoryCounts est maintenant géré par un useMemo
   const [isLoading, setIsLoading] = useState(true);
   const [isArchiving, setIsArchiving] = useState(false);
   const [isRecategorizing, setIsRecategorizing] = useState(false);
@@ -107,20 +103,20 @@ export default function Dashboard() {
   const [modalData, setModalData] = useState({ categoryName: '', articles: [], isLoading: false });
   const [filters, setFilters] = useState({ source: "all", category: "all" });
   const [titleSearchTerm, setTitleSearchTerm] = useState("");
-  const [articleGeneratingSummaryId, setArticleGeneratingSummaryId] = useState(null);
 
-  // ✅ NOUVEAU : Debounce pour la recherche
   const debouncedSearchTerm = useDebounce(titleSearchTerm, 300);
 
-  // ✅ NOUVEAU : Normaliser le terme de recherche une seule fois
   const normalizedSearchTerm = useMemo(() =>
     debouncedSearchTerm.toLowerCase().trim(),
     [debouncedSearchTerm]
   );
 
-  // ✅ MODIFIÉ : Réduire le max à 3 jours pour éviter les timeouts
   const [scanDays, setScanDays] = useState(1);
   const [isScanning, setIsScanning] = useState(false);
+  const [articleGeneratingSummaryId, setArticleGeneratingSummaryId] = useState(null);
+
+  // Utiliser la constante par défaut
+  const [displayHours, setDisplayHours] = useState(DEFAULT_DISPLAY_HOURS);
 
   // États pour le suivi de progression du scan
   const [processedSourcesCount, setProcessedSourcesCount] = useState(0);
@@ -149,22 +145,21 @@ export default function Dashboard() {
     [sources]
   );
 
-  // Les statistiques avec logique 48h unifiée
+  // Les statistiques avec logique dynamique
   const categoryCounts = useMemo(() => {
     const counts = {};
     let uncategorizedCount = 0;
-    const currentMoment = new Date();
 
     const articlesToCount = Array.from(articlesById.values());
     articlesToCount.forEach(article => {
-        // Vérifier si l'article est dans la fenêtre de 48h
-        const diffInHours = (currentMoment - new Date(article.publication_date)) / (1000 * 60 * 60);
-        const isActiveForDashboard = diffInHours <= RECENT_HOURS;
+        // Utiliser le helper
+        const isActiveForDashboard = isArticleInTimeRange(article, displayHours);
 
-        if (!isActiveForDashboard) return; // Ignorer les articles plus anciens que 48h
+        if (!isActiveForDashboard) return;
 
-        const isExcluded = EXCLUDED_CATEGORIES_FROM_STATS_AND_UNCATEGORIZED.some(cat => article.categories?.includes(cat));
-        if (isExcluded) return; // L'article est complètement ignoré pour tous les comptes s'il contient une catégorie exclue
+        // Utiliser la constante partagée
+        const isExcluded = EXCLUDED_CATEGORIES_STATS.some(cat => article.categories?.includes(cat));
+        if (isExcluded) return;
 
         const articleCategories = article.categories || [];
         const isCategorized = articleCategories.length > 0 && !articleCategories.includes('Aucune catégorie détectée');
@@ -174,8 +169,6 @@ export default function Dashboard() {
         }
 
         articleCategories.forEach(catName => {
-            // Si nous arrivons ici, l'article n'est pas exclu par les catégories globales.
-            // Nous voulons seulement compter les catégories réelles, pas le marqueur 'Aucune catégorie détectée'.
             if (catName !== 'Aucune catégorie détectée') {
                 counts[catName] = (counts[catName] || 0) + 1;
             }
@@ -184,39 +177,35 @@ export default function Dashboard() {
 
     counts['Uncategorized'] = uncategorizedCount;
     return counts;
-  }, [articlesById]);
+  }, [articlesById, displayHours]);
 
-  // ✅ OPTIMISÉ : Articles filtrés avec recherche pré-calculée
+  // OPTIMISÉ : Articles filtrés avec recherche pré-calculée
   const filteredArticles = useMemo(() => {
-    const currentMoment = new Date();
     const allArticlesArray = Array.from(articlesById.values());
 
     return allArticlesArray.filter(a => {
-      // Exclure seulement 'Politique' du fil principal (logique différente des stats)
-      const hasExcludedCategories = ['Politique'].some(cat =>
+      // Utiliser la constante partagée
+      const hasExcludedCategories = EXCLUDED_CATEGORIES_FEED.some(cat =>
         a.categories?.includes(cat)
       );
       if (hasExcludedCategories) {
         return false;
       }
 
-      // Filtre temporal unifié (48h)
-      const diffInHours = (currentMoment - new Date(a.publication_date)) / (1000 * 60 * 60);
-      const isRecent = diffInHours <= RECENT_HOURS;
-
-      if (!isRecent) return false; // Ne pas afficher les articles plus anciens que 48h
+      // Utiliser le helper
+      const isRecent = isArticleInTimeRange(a, displayHours);
+      if (!isRecent) return false;
 
       // Filtres utilisateur
       const sourceMatch = filters.source === 'all' ? true : (
         a.source_id === filters.source || (a.grouped_sources && a.grouped_sources.includes(filters.source))
       );
       const categoryMatch = filters.category === 'all' ? true : (filters.category === 'Uncategorized' ? (!a.categories || a.categories.length === 0 || a.categories[0] === 'Aucune catégorie détectée') : a.categories?.includes(filters.category));
-      // ✅ CHANGÉ : Utiliser _searchTitle pré-calculé
       const titleMatch = !normalizedSearchTerm || a._searchTitle.includes(normalizedSearchTerm);
 
       return sourceMatch && categoryMatch && titleMatch;
     }).sort((a, b) => new Date(b.publication_date) - new Date(a.publication_date));
-  }, [articlesById, filters, normalizedSearchTerm]); // ✅ CHANGÉ : normalizedSearchTerm dans les dépendances
+  }, [articlesById, filters, normalizedSearchTerm, displayHours]);
 
   // Calcul du windowing virtuel
   const itemHeight = isCompactView ? ITEM_HEIGHT_COMPACT : ITEM_HEIGHT_COMFORT;
@@ -224,31 +213,56 @@ export default function Dashboard() {
   const endIndex = Math.min(filteredArticles.length, startIndex + Math.ceil(viewportHeight / itemHeight) + 2 * VIEWPORT_PADDING);
   const visibleArticles = filteredArticles.slice(startIndex, endIndex);
 
-  // ✅ MODIFIÉ : Fonction de rafraîchissement avec normalisation des titres
+  // MODIFIÉ : loadData avec retry et validation
   const loadData = useCallback(async (force = false) => {
+    const timer = dashboardLogger.time('loadData');
+
     const now = Date.now();
     if (!force && now - lastLoadTime < 2000) {
-      console.log("LOG: Rafraîchissement ignoré (protection rate limit)");
+      dashboardLogger.debug("Rafraîchissement ignoré (rate limit)", { lastLoadTime });
       return;
     }
     setLastLoadTime(now);
 
-    console.log("LOG: Début rafraîchissement des articles...");
+    dashboardLogger.info("Début rafraîchissement des articles");
     try {
-        const allArticles = await Article.list("-publication_date", ARTICLE_FETCH_LIMIT);
-        // ✅ CHANGÉ : Ajouter _searchTitle normalisé à chaque article
-        setArticlesById(new Map(allArticles.map(article => [
-          article.id,
-          {
-            ...article,
-            _searchTitle: article.title.toLowerCase()
-          }
-        ])));
-        setHasMorePages(allArticles.length === ARTICLE_FETCH_LIMIT);
-        console.log(`LOG: ✅ ${allArticles.length} articles chargés`);
+      // AVEC RETRY AUTOMATIQUE
+      const allArticles = await withRetry(
+        () => Article.list("-publication_date", ARTICLE_FETCH_LIMIT),
+        2, // 2 tentatives supplémentaires
+        2000 // 2 secondes entre les tentatives
+      );
+
+      // VALIDATION ET SANITISATION
+      const { valid, invalid } = validateAndSanitizeArticles(allArticles);
+
+      if (invalid.length > 0) {
+        dashboardLogger.warn(`Articles invalides ignorés`, {
+          count: invalid.length,
+          ids: invalid.map(i => i.article.id)
+        });
+      }
+
+      // Utiliser les articles validés avec _searchTitle et _timestamp déjà calculés
+      setArticlesById(new Map(valid.map(article => [article.id, article])));
+      setHasMorePages(valid.length === ARTICLE_FETCH_LIMIT);
+
+      timer.end();
+      dashboardLogger.info(`Articles chargés avec succès`, { count: valid.length });
     } catch (error) {
-        console.error("LOG: ❌ Erreur de rafraîchissement", error);
-        toast({ title: "Erreur de rafraîchissement", variant: "destructive" });
+      dashboardLogger.error("Erreur de rafraîchissement", {
+        error: error.message,
+        stack: error.stack
+      });
+
+      // MESSAGE D'ERREUR CONTEXTUALISÉ
+      const errorInfo = handleApiError(error, 'loadData');
+      toast({
+        title: errorInfo.title,
+        description: errorInfo.description,
+        variant: "destructive",
+        duration: 5000
+      });
     }
   }, [lastLoadTime, toast]);
 
@@ -262,13 +276,13 @@ export default function Dashboard() {
       const FIFTEEN_MINUTES = 15 * 60 * 1000;
 
       if (!lastScanTime || (now - parseInt(lastScanTime)) > FIFTEEN_MINUTES) {
-        console.log("LOG: 🔄 Auto-scan déclenché (plus de 15min depuis le dernier)");
+        dashboardLogger.info("🔄 Auto-scan déclenché", { reason: 'timeout' });
         localStorage.setItem(lastScanKey, now.toString());
 
         // Déclencher scan en arrière-plan sans bloquer l'UI
         // Assuming captageComplet() without params defaults to a reasonable short period (24 hours)
         captageComplet({ scanHours: 24 }).then(response => {
-          console.log("LOG: ✅ Auto-scan terminé:", response.data);
+          dashboardLogger.info("✅ Auto-scan terminé", { response: response.data });
 
           // Si des articles ont été ajoutés, recharger les données
           if (response.data?.articles_added > 0) {
@@ -279,68 +293,107 @@ export default function Dashboard() {
             setTimeout(() => loadData(true), 2000); // Recharger après 2s, forcé
           }
         }).catch(error => {
-          console.error("LOG: ❌ Erreur auto-scan:", error);
+          // CORRECTION : Logger l'erreur correctement
+          dashboardLogger.error("❌ Erreur auto-scan", {
+            message: error.message,
+            stack: error.stack,
+            name: error.name
+          });
           // Ne pas afficher d'erreur à l'utilisateur pour ne pas perturber l'expérience
         });
       } else {
-        console.log("LOG: ⏭️ Auto-scan non nécessaire (moins de 15min depuis le dernier)");
+        dashboardLogger.debug("⏭️ Auto-scan non nécessaire", { reason: 'recent' });
       }
     } catch (error) {
-      console.error("LOG: ❌ Erreur vérification auto-scan:", error);
+      // CORRECTION : Logger l'erreur correctement
+      dashboardLogger.error("❌ Erreur vérification auto-scan", {
+        message: error.message,
+        stack: error.stack,
+        name: error.name
+      });
     }
   }, [toast, loadData]);
 
-  // ✅ MODIFIÉ : Chargement initial avec normalisation des titres
+  // MODIFIÉ : Chargement initial avec restauration de displayHours
   useEffect(() => {
     const performInitialLoad = async () => {
         if (hasInitiallyLoaded.current) return;
         hasInitiallyLoaded.current = true;
 
         setIsLoading(true);
-        console.log("LOG: Lancement du chargement initial complet...");
+        const timer = dashboardLogger.time('initialLoad');
+        dashboardLogger.info("Lancement du chargement initial complet");
 
         try {
-            console.log("LOG: 🧹 Nettoyage préventif des dates futures...");
+            dashboardLogger.info("🧹 Nettoyage préventif des dates futures");
             try {
                 await cleanupFutureArticles();
-                console.log("LOG: ✅ Nettoyage terminé");
+                dashboardLogger.info("✅ Nettoyage terminé");
             } catch (cleanupError) {
-                console.log("LOG: ⚠️ Erreur nettoyage:", cleanupError.message);
-                // Optionally show a toast for cleanup error if it's critical
-                // toast({ title: "Erreur de nettoyage", description: cleanupError.message, variant: "destructive" });
+                dashboardLogger.warn("Erreur nettoyage", { error: cleanupError.message });
             }
 
             const [articlesData, sourcesData, categoriesData] = await Promise.all([
-                Article.list("-publication_date", ARTICLE_FETCH_LIMIT),
-                Source.list(),
-                Category.list()
+                withRetry(() => Article.list("-publication_date", ARTICLE_FETCH_LIMIT), 2, 2000),
+                withRetry(() => Source.list(), 2, 2000),
+                withRetry(() => Category.list(), 2, 2000)
             ]);
 
-            // ✅ CHANGÉ : Ajouter _searchTitle normalisé à chaque article
-            setArticlesById(new Map(articlesData.map(article => [
-              article.id,
-              {
-                ...article,
-                _searchTitle: article.title.toLowerCase()
-              }
-            ])));
-            setHasMorePages(articlesData.length === ARTICLE_FETCH_LIMIT);
+            // VALIDATION ET SANITISATION
+            const { valid, invalid } = validateAndSanitizeArticles(articlesData);
+
+            if (invalid.length > 0) {
+                dashboardLogger.warn(`Articles invalides ignorés au chargement`, {
+                    count: invalid.length
+                });
+            }
+
+            setArticlesById(new Map(valid.map(article => [article.id, article])));
+            setHasMorePages(valid.length === ARTICLE_FETCH_LIMIT);
             setSources(sourcesData || []);
             setCategories(categoriesData || []);
 
-            // NOUVEAU : Déclencher l'auto-scan après le chargement initial
+            // NOUVEAU : Restaurer la portée du dernier scan
+            const savedScanHours = localStorage.getItem(STORAGE_KEY_SCAN_HOURS);
+            if (savedScanHours) {
+                const hours = parseInt(savedScanHours);
+                if (!isNaN(hours) && hours > 0) {
+                    setDisplayHours(hours);
+                    dashboardLogger.info(`📊 Portée d'affichage restaurée: ${hours}h`);
+                }
+            } else {
+                dashboardLogger.info(`📊 Aucune portée sauvegardée, utilisation par défaut: ${DEFAULT_DISPLAY_HOURS}h`);
+            }
+
+            timer.end();
+            dashboardLogger.info("Chargement initial terminé", {
+                articles: valid.length,
+                sources: sourcesData.length,
+                categories: categoriesData.length,
+                displayHours: savedScanHours ? parseInt(savedScanHours) : DEFAULT_DISPLAY_HOURS
+            });
+
             setTimeout(checkAndRunAutoScan, 1000);
 
         } catch (error) {
-            console.error("LOG: ❌ Erreur chargement initial:", error);
-            toast({ title: "Erreur de chargement initial", variant: "destructive" });
+            dashboardLogger.error("Erreur chargement initial", {
+                error: error.message,
+                stack: error.stack
+            });
+            const errorInfo = handleApiError(error, 'performInitialLoad');
+            toast({
+                title: errorInfo.title,
+                description: errorInfo.description,
+                variant: "destructive",
+                duration: 8000
+            });
         } finally {
             setIsLoading(false);
         }
     };
 
     performInitialLoad();
-  }, [toast, checkAndRunAutoScan]); // Dépendance stable, ne s'exécute qu'une fois.
+  }, [toast, checkAndRunAutoScan]);
 
   // Periodic refresh
   useEffect(() => {
@@ -379,14 +432,25 @@ export default function Dashboard() {
     return () => window.removeEventListener('resize', updateViewportHeight);
   }, []);
 
+  // NOUVEAU : Helper pour timeout
+  const withTimeout = (promise, timeoutMs, sourceName) => {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Timeout après ${timeoutMs}ms pour ${sourceName}`)), timeoutMs)
+      )
+    ]);
+  };
+
   // ---- Fonction de scan unifiée et complète avec paramètre de durée ----
+  // MODIFIÉ : handleProcessSources avec timeouts et sauvegarde de displayHours
   async function handleProcessSources(scanHours = 24) {
     if (isScanning) {
-      console.log("⚠️ Scan déjà en cours, ignoré");
+      scanLogger.debug("Scan déjà en cours, ignoré");
       return;
     }
 
-    // ✅ SÉCURITÉ : Limiter à 72h max (3 jours)
+    // SÉCURITÉ : Limiter à 72h max (3 jours)
     const maxHours = 72;
     const safeScanHours = Math.min(scanHours, maxHours);
 
@@ -404,151 +468,215 @@ export default function Dashboard() {
     setCurrentSourceName('Initialisation...');
     setScanResults(null);
 
-    // Récupérer le décompte des sources pour le suivi
+    const scanTimer = scanLogger.time(`scan_${safeScanHours}h`);
     const allSources = sources.filter(s => s.status === 'active');
-    // totalToScan: +5 pour JdQ, JdM, Le Quotidien, Le Droit, Radio-Canada Saguenay
     const totalToScan = allSources.length + 5;
     setTotalActiveSources(totalToScan);
 
-    // ✅ Message dynamique basé sur safeScanHours réel
     const scanDaysText = safeScanHours === 24 ? '1 jour' : `${Math.round(safeScanHours/24)} jours`;
+
+    scanLogger.info(`🔍 Scan ${scanDaysText} lancé`, {
+      totalSources: totalToScan,
+      scanHours: safeScanHours
+    });
+
     toast({
       title: `🔍 Scan ${scanDaysText} lancé`,
-      description: `${totalToScan} sources à analyser (${safeScanHours}h).`
+      description: `${totalToScan} sources à analyser (${safeScanHours} heures).`
     });
 
     let articlesAddedInTotal = 0;
     let processedCount = 0;
+    const failedSources = [];
 
     try {
-      // --- 1. Traitement JdQ/JdM via la nouvelle fonction ---
+      // --- 1. JdQ/JdM avec timeout ---
       setCurrentSourceName('Analyse JdQ/JdM...');
       try {
-        const sitemapResult = await Promise.race([
-          scrapeSitemaps(),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout JdQ/JdM (30s)')), 30000))
-        ]);
+        const sourceTimer = scanLogger.time('JdQ/JdM');
+        const sitemapResult = await withTimeout(
+          scrapeSitemaps({ scanHours: safeScanHours }),
+          30000, // 30 secondes max
+          'JdQ/JdM'
+        );
+        sourceTimer.end();
 
         if (sitemapResult.data?.created > 0) {
           articlesAddedInTotal += sitemapResult.data.created;
-          toast({
-            title: `JdQ/JdM analysés`,
-            description: `${sitemapResult.data.created} nouveaux articles.`
-          });
+          scanLogger.info("✅ JdQ/JdM complété", { added: sitemapResult.data.created });
           await delay(1000);
-          await loadData(true); // Forcer le rafraîchissement
+          await loadData(true);
         }
-      } catch (error) {
-        console.warn('⚠️ Erreur JdQ/JdM:', error.message);
-        toast({ title: "Alerte JdQ/JdM", description: error.message, variant: "destructive" });
-      }
-      processedCount += 2; // JdQ et JdM
-      setProcessedSourcesCount(Math.min(totalToScan, processedCount));
 
-      // --- 2. NOUVEAU: Traitement Le Quotidien ---
+        processedCount += 2; // JdQ et JdM
+        setProcessedSourcesCount(Math.min(totalToScan, processedCount));
+      } catch (error) {
+        scanLogger.warn('❌ JdQ/JdM échoué', { error: error.message });
+        failedSources.push('JdQ/JdM');
+        processedCount += 2; // Still count as processed to move progress bar
+        setProcessedSourcesCount(Math.min(totalToScan, processedCount));
+      }
+
+      // --- 2. Le Quotidien avec timeout ---
       setCurrentSourceName('Analyse Le Quotidien...');
       try {
-        const quotidienResult = await Promise.race([
+        const sourceTimer = scanLogger.time('LeQuotidien');
+        const quotidienResult = await withTimeout(
           scrapeLeQuotidien(),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout Le Quotidien (30s)')), 30000))
-        ]);
+          30000,
+          'Le Quotidien'
+        );
+        sourceTimer.end();
 
         if (quotidienResult.data?.created > 0) {
           articlesAddedInTotal += quotidienResult.data.created;
-          toast({
-            title: `Le Quotidien analysé`,
-            description: `${quotidienResult.data.created} nouveaux articles.`
-          });
+          scanLogger.info("✅ Le Quotidien complété", { added: quotidienResult.data.created });
           await delay(1000);
-          await loadData(true); // Forcer le rafraîchissement
+          await loadData(true);
         }
-      } catch (error) {
-        console.warn('⚠️ Erreur Le Quotidien:', error.message);
-        toast({ title: "Alerte Le Quotidien", description: error.message, variant: "destructive" });
-      }
-      processedCount += 1; // Le Quotidien
-      setProcessedSourcesCount(Math.min(totalToScan, processedCount));
 
-      // --- 3. NOUVEAU: Traitement Le Droit ---
+        processedCount += 1; // Le Quotidien
+        setProcessedSourcesCount(Math.min(totalToScan, processedCount));
+      } catch (error) {
+        scanLogger.warn('❌ Le Quotidien échoué', { error: error.message });
+        failedSources.push('Le Quotidien');
+        processedCount += 1; // Still count as processed
+        setProcessedSourcesCount(Math.min(totalToScan, processedCount));
+      }
+
+      // --- 3. Le Droit avec timeout ---
       setCurrentSourceName('Analyse Le Droit...');
       try {
-        const leDroitResult = await Promise.race([
+        const sourceTimer = scanLogger.time('LeDroit');
+        const droitResult = await withTimeout(
           scrapeLeDroit(),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout Le Droit (30s)')), 30000))
-        ]);
+          30000,
+          'Le Droit'
+        );
+        sourceTimer.end();
 
-        if (leDroitResult.data?.created > 0) {
-          articlesAddedInTotal += leDroitResult.data.created;
-          toast({
-            title: `Le Droit analysé`,
-            description: `${leDroitResult.data.created} nouveaux articles.`
-          });
+        if (droitResult.data?.created > 0) {
+          articlesAddedInTotal += droitResult.data.created;
+          scanLogger.info("✅ Le Droit complété", { added: droitResult.data.created });
           await delay(1000);
-          await loadData(true); // Forcer le rafraîchissement
+          await loadData(true);
         }
-      } catch (error) {
-        console.warn('⚠️ Erreur Le Droit:', error.message);
-        toast({ title: "Alerte Le Droit", description: error.message, variant: "destructive" });
-      }
-      processedCount += 1; // Le Droit
-      setProcessedSourcesCount(Math.min(totalToScan, processedCount));
 
-      // --- 4. NOUVEAU: Traitement Radio-Canada Saguenay ---
+        processedCount += 1; // Le Droit
+        setProcessedSourcesCount(Math.min(totalToScan, processedCount));
+      } catch (error) {
+        scanLogger.warn('❌ Le Droit échoué', { error: error.message });
+        failedSources.push('Le Droit');
+        processedCount += 1; // Still count as processed
+        setProcessedSourcesCount(Math.min(totalToScan, processedCount));
+      }
+
+      // --- 4. Radio-Canada Saguenay avec timeout ---
       setCurrentSourceName('Analyse Radio-Canada Saguenay...');
       try {
-        const saguenayResult = await Promise.race([scrapeRadioCanadaSaguenay(), new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout RC Saguenay (30s)')), 30000))]);
+        const sourceTimer = scanLogger.time('RadioCanadaSaguenay');
+        const saguenayResult = await withTimeout(
+          scrapeRadioCanadaSaguenay(),
+          30000,
+          'Radio-Canada Saguenay'
+        );
+        sourceTimer.end();
 
         if (saguenayResult.data?.created > 0) {
           articlesAddedInTotal += saguenayResult.data.created;
-          toast({
-            title: `Radio-Canada Saguenay analysé`,
-            description: `${saguenayResult.data.created} nouveaux articles.`
-          });
+          scanLogger.info("✅ Radio-Canada Saguenay complété", { added: saguenayResult.data.created });
+          await delay(1000);
+          await loadData(true);
+        }
+
+        processedCount += 1; // Radio-Canada Saguenay
+        setProcessedSourcesCount(Math.min(totalToScan, processedCount));
+      } catch (error) {
+        scanLogger.warn('❌ Radio-Canada Saguenay échoué', { error: error.message });
+        failedSources.push('Radio-Canada Saguenay');
+        processedCount += 1; // Still count as processed
+        setProcessedSourcesCount(Math.min(totalToScan, processedCount));
+      }
+
+      // --- 5. Autres sources RSS ---
+      setCurrentSourceName('Traitement des flux RSS...');
+      try {
+        const rssTimer = scanLogger.time('RSS_global');
+        const captageResponse = await withTimeout(
+          captageComplet({ scanHours: safeScanHours }),
+          120000, // 2 minutes max pour tous les RSS
+          'RSS global'
+        );
+        rssTimer.end();
+
+        setScanResults(captageResponse.data);
+
+        const rssArticlesAdded = captageResponse.data?.articles_added || 0;
+        const rssSourcesProcessed = captageResponse.data?.sources_processed || 0;
+
+        processedCount += rssSourcesProcessed;
+        setProcessedSourcesCount(Math.min(totalToScan, processedCount));
+        articlesAddedInTotal += rssArticlesAdded;
+
+        scanLogger.info("✅ RSS global complété", {
+          added: rssArticlesAdded,
+          sources: rssSourcesProcessed
+        });
+
+        if (rssArticlesAdded > 0) {
           await delay(1000);
           await loadData(true);
         }
       } catch (error) {
-        console.warn('⚠️ Erreur Radio-Canada Saguenay:', error.message);
-        toast({ title: "Alerte RC Saguenay", description: error.message, variant: "destructive" });
-      }
-      processedCount += 1; // Radio-Canada Saguenay
-      setProcessedSourcesCount(Math.min(totalToScan, processedCount));
-
-      // --- 5. Traitement exhaustif des autres sources RSS avec paramètre de durée ---
-      setCurrentSourceName('Traitement des flux RSS...');
-      // Pass the safeScanHours parameter to captageComplet
-      const captageResponse = await captageComplet({ scanHours: safeScanHours }); // ✅ PARAMÈTRE DYNAMIQUE
-      setScanResults(captageResponse.data); // Stocker les résultats
-
-      const rssArticlesAdded = captageResponse.data?.articles_added || 0;
-      const rssSourcesProcessed = captageResponse.data?.sources_processed || 0;
-
-      processedCount += rssSourcesProcessed;
-      setProcessedSourcesCount(Math.min(totalToScan, processedCount));
-      articlesAddedInTotal += rssArticlesAdded;
-
-      if (rssArticlesAdded > 0) {
-        await delay(1000);
-        await loadData(true); // Forcer le rafraîchissement après le scan
+        scanLogger.warn('❌ Scan RSS échoué', { error: error.message });
+        failedSources.push('RSS');
       }
 
       const scanDuration = Math.round((Date.now() - scanStartTime) / 1000);
+      scanTimer.end();
 
-      toast({
-        title: `🎉 Scan ${scanDaysText} terminé !`,
-        description: `${articlesAddedInTotal} articles ajoutés, ${scanResults?.articles_rejected || 0} rejetés en ${scanDuration}s.`,
-        duration: 8000
+      // NOUVEAU : Sauvegarder la portée du scan réussi
+      setDisplayHours(safeScanHours);
+      localStorage.setItem(STORAGE_KEY_SCAN_HOURS, safeScanHours.toString());
+
+      scanLogger.info("🎉 Scan terminé", {
+        totalAdded: articlesAddedInTotal,
+        duration: scanDuration,
+        failedCount: failedSources.length,
+        failedSources: failedSources,
+        newDisplayHours: safeScanHours
       });
+
+      // TOAST avec info sur les échecs
+      if (failedSources.length > 0) {
+        toast({
+          title: `⚠️ Scan ${scanDaysText} terminé avec avertissements`,
+          description: `${articlesAddedInTotal} articles ajoutés. ${failedSources.length} source(s) ont échoué: ${failedSources.join(', ')}. Le Dashboard affiche maintenant les ${safeScanHours}h.`,
+          variant: "default",
+          duration: 10000
+        });
+      } else {
+        toast({
+          title: `🎉 Scan ${scanDaysText} terminé !`,
+          description: `${articlesAddedInTotal} articles ajoutés en ${scanDuration}s. Le Dashboard affiche maintenant les ${safeScanHours}h.`,
+          duration: 8000
+        });
+      }
 
     } catch (error) {
-      console.error('❌ Erreur scan:', error);
+      scanLogger.error('❌ Erreur scan globale', {
+        error: error.message,
+        stack: error.stack
+      });
+      const errorInfo = handleApiError(error, 'handleProcessSources');
       toast({
-        title: "❌ Erreur de scan",
-        description: error.message || "Une erreur est survenue",
-        variant: "destructive"
+        title: errorInfo.title,
+        description: errorInfo.description,
+        variant: "destructive",
+        duration: 8000
       });
     } finally {
-      setIsScanning(false); // Désactiver l'état de scan spécifique
+      setIsScanning(false);
       setCurrentSourceName('');
       setScanStartTime(null);
     }
@@ -567,7 +695,7 @@ export default function Dashboard() {
 
     try {
       // ÉTAPE 1 : Nettoyage des doublons (optimisé)
-      console.log('LOG: 🧹 Étape 1/2 - Nettoyage des doublons...');
+      dashboardLogger.info('🧹 Nettoyage des doublons - Début');
 
       let totalDuplicatesDeleted = 0;
       let totalArticlesMerged = 0;
@@ -577,7 +705,7 @@ export default function Dashboard() {
 
       while (hasMore && attempts < maxAttempts) {
         attempts++;
-        console.log(`LOG: 🧹 Pass ${attempts}/${maxAttempts} - Nettoyage des doublons...`);
+        dashboardLogger.debug(`🧹 Nettoyage des doublons - Pass ${attempts}/${maxAttempts}`);
 
         try {
           const cleanupResponse = await cleanupDuplicates();
@@ -600,7 +728,7 @@ export default function Dashboard() {
             hasMore = false;
           }
         } catch (cleanupError) {
-          console.error(`LOG: ❌ Erreur cleanup pass ${attempts}:`, cleanupError);
+          dashboardLogger.error(`❌ Erreur cleanup pass ${attempts}`, { error: cleanupError.message, stack: cleanupError.stack });
           hasMore = false;
         }
       }
@@ -614,8 +742,8 @@ export default function Dashboard() {
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
-      // ÉTAPE 2 : Re-catégoriser avec timeout étendu
-      console.log('LOG: 🏷️ Étape 2/2 - Re-catégorisation...');
+      // ÉTAPE 2 : Re-catégoriser (SANS signal qui cause des problèmes)
+      dashboardLogger.info('🏷️ Re-catégorisation - Début');
       toast({
         title: "🏷️ Re-catégorisation en cours",
         description: "Cette étape peut prendre jusqu'à 3 minutes...",
@@ -623,14 +751,8 @@ export default function Dashboard() {
       });
 
       try {
-        // Augmenter le timeout à 5 minutes pour cette opération
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutes
-
-        const recatResponse = await recategorizeALL({ signal: controller.signal });
-        clearTimeout(timeoutId);
-
-        const recatResult = recatResponse.data;
+        // CORRECTION: Ne pas passer de signal, utiliser base44.functions.invoke
+        const { data: recatResult } = await base44.functions.invoke('recategorizeALL', {});
 
         if (recatResult.error) {
           throw new Error(recatResult.error);
@@ -643,24 +765,29 @@ export default function Dashboard() {
         });
 
         await new Promise(resolve => setTimeout(resolve, 2000));
-        // Forcer le rafraîchissement
         loadData(true);
 
       } catch (recatError) {
-        if (recatError.name === 'AbortError') {
-          toast({
-            title: "⚠️ Timeout",
-            description: "La re-catégorisation prend trop de temps. Elle continue en arrière-plan. Rafraîchissez dans 2 minutes.",
-            variant: "destructive",
-            duration: 10000
-          });
-        } else {
-          throw recatError;
-        }
+        // Meilleure gestion d'erreur
+        const errorMessage = recatError.response?.data?.error || recatError.message || "Erreur inconnue";
+        
+        dashboardLogger.error('❌ Erreur re-catégorisation', {
+          error: errorMessage,
+          status: recatError.response?.status
+        });
+        
+        toast({
+          title: "⚠️ Erreur de re-catégorisation",
+          description: errorMessage === "Rate limit exceeded" 
+            ? "Trop de requêtes. Réessayez dans 2 minutes." 
+            : errorMessage,
+          variant: "destructive",
+          duration: 10000
+        });
       }
 
     } catch (error) {
-      console.error('LOG: ❌ Erreur handleRecategorizeAll:', error);
+      dashboardLogger.error('❌ Erreur handleRecategorizeAll', { error: error.message, stack: error.stack });
       toast({
         title: "Erreur",
         description: error.message || "Une erreur est survenue. Réessayez dans quelques secondes.",
@@ -690,7 +817,7 @@ export default function Dashboard() {
     const runArchiveBatch = async () => {
       try {
         attempts++;
-        console.log(`LOG: 📦 Tentative ${attempts}...`);
+        dashboardLogger.debug(`📦 Archivage - Tentative ${attempts}`);
 
         const response = await archiveAllArticles();
         const result = response.data;
@@ -702,16 +829,9 @@ export default function Dashboard() {
         totalArchivedOverall += result.total_archived || 0;
 
         // Mise à jour de l'UI en temps réel
-        if (result.total_archived > 0) { // Only update if articles were actually archived in this batch
+        if (result.total_archived > 0) {
             setArticlesById(prevMap => {
               const newMap = new Map(prevMap);
-              // Supprimer les X premiers articles de la Map
-              // This relies on the assumption that archiveAllArticles archives the articles
-              // that correspond to the first keys yielded by newMap.keys().
-              // In a typical setup, archiving targets old articles, while Article.list("-publication_date")
-              // retrieves newest articles first. If articlesById is populated newest first,
-              // removing the first keys would remove the newest. This might require clarification
-              // or a more sophisticated matching if backend archives oldest by default.
               const articlesToRemove = Array.from(newMap.keys()).slice(0, result.total_archived || 0);
               articlesToRemove.forEach(id => newMap.delete(id));
               return newMap;
@@ -739,10 +859,10 @@ export default function Dashboard() {
           // Vider complètement la liste locale
           setArticlesById(new Map());
 
-          console.log("LOG: ✅ Archivage terminé");
+          dashboardLogger.info("✅ Archivage terminé");
         }
       } catch (error) {
-        console.error('LOG: ❌ Erreur:', error);
+        dashboardLogger.error('❌ Erreur archivage', { error: error.message, stack: error.stack });
 
         const errorMessage = error.response?.data?.details || error.message || "Une erreur est survenue.";
 
@@ -770,7 +890,7 @@ export default function Dashboard() {
     setShowEditModal(true);
   }, []);
 
-  // ✅ MODIFIÉ : handleSaveCategory avec normalisation
+  // MODIFIÉ : handleSaveCategory avec normalisation
   const handleSaveCategory = useCallback(async (articleId, newCategories) => {
     if (!selectedArticle) return;
 
@@ -786,7 +906,7 @@ export default function Dashboard() {
           ...currentArticle,
           categories: newCategories,
           is_manually_categorized: true,
-          _searchTitle: currentArticle.title.toLowerCase() // ✅ Garder _searchTitle
+          _searchTitle: currentArticle.title.toLowerCase()
         };
         newMap.set(articleId, updatedArticle);
         return newMap;
@@ -794,13 +914,13 @@ export default function Dashboard() {
 
       toast({ title: "Catégorie mise à jour" });
 
-      // 🚨 NOUVEAU : Déclencher les alertes après catégorisation manuelle
+      // NOUVEAU : Déclencher les alertes après catégorisation manuelle
       try {
-        console.log(`LOG: 📨 Déclenchement des alertes pour l'article ID: ${articleId}`);
+        dashboardLogger.info(`📨 Déclenchement des alertes pour l'article ID: ${articleId}`);
         const alertResponse = await processArticleAlerts({ articleId });
 
         if (alertResponse.data?.message) {
-          console.log(`LOG: 📨 ✅ ${alertResponse.data.message}`);
+          dashboardLogger.info(`📨 ✅ Alertes traitées`, { message: alertResponse.data.message });
         }
 
         // Notification visuelle si des alertes ont été envoyées (si des catégories ont été assignées)
@@ -813,7 +933,7 @@ export default function Dashboard() {
         }
 
       } catch (alertError) {
-        console.error(`LOG: ❌ Erreur lors de l'envoi des alertes:`, alertError);
+        dashboardLogger.error(`❌ Erreur lors de l'envoi des alertes`, { error: alertError.message, stack: alertError.stack });
         toast({
           title: "⚠️ Alertes partielles",
           description: "L'article a été catégorisé mais certaines alertes ont échoué.",
@@ -826,7 +946,7 @@ export default function Dashboard() {
     }
   }, [selectedArticle, toast]);
 
-  // ✅ MODIFIÉ : handleSummaryUpdate avec normalisation
+  // MODIFIÉ : handleSummaryUpdate avec normalisation
   const handleSummaryUpdate = useCallback(async (articleId, newSummary) => {
     try {
       await Article.update(articleId, { summary: newSummary });
@@ -837,7 +957,7 @@ export default function Dashboard() {
         const updatedArticle = {
           ...currentArticle,
           summary: newSummary,
-          _searchTitle: currentArticle.title.toLowerCase() // ✅ Garder _searchTitle
+          _searchTitle: currentArticle.title.toLowerCase()
         };
         newMap.set(articleId, updatedArticle);
         return newMap;
@@ -871,17 +991,13 @@ export default function Dashboard() {
     setShowCategoryArticlesModal(true);
     try {
       let articlesForCategory;
-      const currentMoment = new Date();
-      const allArticlesArray = Array.from(articlesById.values());
-
-      articlesForCategory = allArticlesArray.filter(art => {
-        // 1. Filtrer par recence (48 heures)
-        const diffInHours = (currentMoment - new Date(art.publication_date)) / (1000 * 60 * 60);
-        const isRecent = diffInHours <= RECENT_HOURS;
+      articlesForCategory = Array.from(articlesById.values()).filter(art => {
+        // 1. Filtrer par recence (displayHours heures)
+        const isRecent = isArticleInTimeRange(art, displayHours);
         if (!isRecent) return false;
 
         // 2. Filtrer par les catégories exclues pour les statistiques (cohérent avec categoryCounts)
-        const isExcludedFromStats = EXCLUDED_CATEGORIES_FROM_STATS_AND_UNCATEGORIZED.some(cat => art.categories?.includes(cat));
+        const isExcludedFromStats = EXCLUDED_CATEGORIES_STATS.some(cat => art.categories?.includes(cat));
         if (isExcludedFromStats) return false;
 
         // 3. Filtrer par la catégorie spécifique demandée
@@ -916,7 +1032,7 @@ export default function Dashboard() {
         return {
           ...article,
           source: sourceNames.length > 0 ? sourceNames.join(' / ') : 'Source inconnue',
-          grouped_sources: sourceNames // Keep grouped_sources if needed, or add new field for display
+          grouped_sources: sourceNames
         };
       });
 
@@ -1021,17 +1137,15 @@ export default function Dashboard() {
     [categoryCounts]
   );
 
-  // Total basé sur les articles actifs (48h)
+  // Total basé sur les articles actifs (displayHours)
   const totalArticlesInStats = useMemo(() => {
     // CORRECTION : Exclure seulement 'Politique' du total pour correspondre au filtre
-    const currentMoment = new Date();
     return Array.from(articlesById.values()).filter(article => {
-      const diffInHours = (currentMoment - new Date(article.publication_date)) / (1000 * 60 * 60);
-      const isExcluded = EXCLUDED_CATEGORIES_FROM_STATS_AND_UNCATEGORIZED.some(cat => article.categories?.includes(cat)); // Use the consistent exclusion list
-      // Only count articles within the RECENT_HOURS window AND not in the excluded list
-      return diffInHours <= RECENT_HOURS && !isExcluded;
+      const isRecent = isArticleInTimeRange(article, displayHours);
+      const isExcluded = EXCLUDED_CATEGORIES_STATS.some(cat => article.categories?.includes(cat));
+      return isRecent && !isExcluded;
     }).length;
-  }, [articlesById]);
+  }, [articlesById, displayHours]);
 
   // Fonction pour calculer le temps écoulé pour l'affichage
   const getElapsedTime = () => {
@@ -1188,7 +1302,7 @@ export default function Dashboard() {
                 onChange={(e) => setTitleSearchTerm(e.target.value)}
                 className="pl-10"
               />
-              {/* ✅ NOUVEAU : Indicateur de recherche active */}
+              {/* NOUVEAU : Indicateur de recherche active */}
               {titleSearchTerm && titleSearchTerm !== debouncedSearchTerm && (
                 <div className="absolute right-3 top-1/2 -translate-y-1/2">
                   <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
@@ -1199,7 +1313,26 @@ export default function Dashboard() {
         </div>
 
         <div className="space-y-4">
-          <p className="text-gray-600 text-sm">{filteredArticles.length} article{filteredArticles.length > 1 ? 's' : ''} trouvé{filteredArticles.length > 1 ? 's' : ''}</p>
+          {/* NOUVEAU : Afficher la portée d'affichage */}
+          <div className="flex items-center justify-between">
+            <p className="text-gray-600 text-sm">
+              {filteredArticles.length} article{filteredArticles.length > 1 ? 's' : ''} trouvé{filteredArticles.length > 1 ? 's' : ''}
+            </p>
+
+            <div className="flex items-center gap-2 text-sm">
+              <Clock className="w-4 h-4 text-blue-600" />
+              <span className="text-slate-600">
+                Affichage : <strong className="text-slate-900">
+                  {displayHours === 24 ? '24h' : `${Math.round(displayHours/24)} jours`}
+                </strong>
+              </span>
+              {displayHours !== DEFAULT_DISPLAY_HOURS && (
+                <Badge variant="outline" className="text-xs">
+                  Portée du dernier scan
+                </Badge>
+              )}
+            </div>
+          </div>
 
           {isLoading && filteredArticles.length === 0 ? (
             <p>Chargement des articles...</p>
@@ -1230,7 +1363,7 @@ export default function Dashboard() {
                     onSummaryUpdate={handleSummaryUpdate}
                     onGenerateAISummary={handleGenerateAISummary}
                     isGeneratingAISummary={articleGeneratingSummaryId === article.id}
-                    onDelete={handleDeleteArticle} // Passed the new handleDeleteArticle
+                    onDelete={handleDeleteArticle}
                   />
                 ))}
               </div>
@@ -1256,7 +1389,7 @@ export default function Dashboard() {
         articles={modalData.articles}
         isLoading={modalData.isLoading}
         onEdit={handleEditCategory}
-        onDelete={handleDeleteArticle} // Uses the new handleDeleteArticle (which handles modalData update conditionally)
+        onDelete={handleDeleteArticle}
         onMarkIrrelevant={handleMarkIrrelevant}
       />
     </div>

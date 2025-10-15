@@ -6,11 +6,21 @@ import { Button } from "@/components/ui/button";
 import { ExternalLink, Calendar, Clock, Edit3, FileText, Loader2, Rss, Users, AlertTriangle, Tag, Trash2 } from "lucide-react";
 import { format, isToday, parseISO } from "date-fns";
 import { fr } from "date-fns/locale";
-import { generateSummary } from "@/api/functions";
-import { sendAlertForArticle } from "@/api/functions";
+import { base44 } from "@/api/base44Client"; // Added this import
 import { useToast } from "@/components/ui/use-toast";
 import SummaryModal from "./SummaryModal";
 import KeywordsModal from "./KeywordsModal";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import { TeamsChannel } from "@/api/entities";
+// Removed: import { generateSummary } from "@/api/functions";
+// Removed: import { sendToTeamsChannel } from "@/api/functions";
 
 // CONFIGURATION CENTRALISÉE des couleurs de catégories
 const CATEGORY_COLORS = {
@@ -35,14 +45,20 @@ export default function ArticleCard({
   onGenerateAISummary,
   isGeneratingAISummary,
   isCompact = false,
-  onDelete // NOUVEAU: callback pour supprimer l'article
+  onDelete
 }) {
   // États locaux optimisés
   const [isGeneratingLocalSummary, setIsGeneratingLocalSummary] = useState(false);
   const [summaryContent, setSummaryContent] = useState('');
   const [isSummaryModalOpen, setIsSummaryModalOpen] = useState(false);
-  const [isSendingAlert, setIsSendingAlert] = useState(false);
   const [isKeywordsModalOpen, setIsKeywordsModalOpen] = useState(false);
+  
+  // États pour le modal Teams
+  const [showTeamsModal, setShowTeamsModal] = useState(false);
+  const [teamsChannels, setTeamsChannels] = useState([]);
+  const [isLoadingChannels, setIsLoadingChannels] = useState(false);
+  const [isSendingToTeams, setIsSendingToTeams] = useState(false);
+  
   const { toast } = useToast();
   
   // UTILITAIRE: Décodage HTML sécurisé et optimisé
@@ -71,7 +87,6 @@ export default function ArticleCard({
         return { dateLabel: 'Date invalide', timeLabel: '', isRecent: false };
       }
 
-      // Check for future dates
       if (pubDate > new Date()) {
           return { dateLabel: 'Date future', timeLabel: '', isRecent: false };
       }
@@ -88,7 +103,7 @@ export default function ArticleCard({
     }
   }, [article.publication_date]);
 
-  // REGROUPEMENT de sources optimisé - SIMPLIFIÉ
+  // REGROUPEMENT de sources optimisé
   const groupedSources = React.useMemo(() => {
     if (!article.grouped_sources || article.grouped_sources.length <= 1) {
       return [{ name: source || 'Source inconnue', count: 1 }];
@@ -103,7 +118,7 @@ export default function ArticleCard({
     
     return Object.entries(sourceCounts)
       .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => b.count - a.count); // Tri par fréquence
+      .sort((a, b) => b.count - a.count);
   }, [article.grouped_sources, sources, source]);
 
   const isMultipleSources = groupedSources.length > 1;
@@ -114,7 +129,6 @@ export default function ArticleCard({
     
     let cleanedText = decodeHtml(text);
     
-    // Supprimer préfixes courants
     const prefixPatterns = [
       /^Article du [^:]+:\s*/i,
       /^Article de [^:]+:\s*/i,
@@ -126,7 +140,6 @@ export default function ArticleCard({
       cleanedText = cleanedText.replace(pattern, '');
     });
     
-    // Éviter répétition du titre
     if (article.title) {
       const decodedTitle = decodeHtml(article.title);
       if (cleanedText.toLowerCase().startsWith(decodedTitle.toLowerCase())) {
@@ -140,7 +153,6 @@ export default function ArticleCard({
       const sentences = cleanedText.split(/[.!?]+/);
       let bestSentence = sentences[0]?.trim();
       
-      // Prendre deuxième phrase si première trop courte
       if ((!bestSentence || bestSentence.length < 30) && sentences[1]) {
         const secondSentence = sentences[1]?.trim();
         if (secondSentence && secondSentence.length > 20) {
@@ -153,7 +165,6 @@ export default function ArticleCard({
       }
     }
     
-    // Fallback sur summary si différent du titre
     if (article.summary && article.summary !== article.title) {
       const decodedSummary = decodeHtml(article.summary);
       if (decodedSummary.length > article.title.length + 10) {
@@ -164,7 +175,7 @@ export default function ArticleCard({
     return '';
   }, [article.title, article.summary]);
 
-  // HANDLERS optimisés avec debounce
+  // HANDLER: Générer résumé
   const handleGenerateSummary = React.useCallback(async () => {
     if (isGeneratingLocalSummary) return;
     
@@ -173,7 +184,7 @@ export default function ArticleCard({
     setIsSummaryModalOpen(true);
     
     try {
-      const { data } = await generateSummary({
+      const { data } = await base44.functions.invoke('generateSummary', {
         title: article.title,
         content: article.content || '',
         url: article.url
@@ -192,28 +203,64 @@ export default function ArticleCard({
     }
   }, [article, isGeneratingLocalSummary, toast]);
 
-  const handleSendAlert = React.useCallback(async () => {
-    if (isSendingAlert) return;
+  // NOUVEAU: Ouvrir le modal Teams et charger les canaux
+  const handleOpenTeamsModal = React.useCallback(async () => {
+    setShowTeamsModal(true);
+    setIsLoadingChannels(true);
     
-    setIsSendingAlert(true);
     try {
-      const { data } = await sendAlertForArticle({ articleId: article.id });
+      const channels = await TeamsChannel.filter({ is_active: true });
+      setTeamsChannels(channels);
+      
+      if (channels.length === 0) {
+        toast({
+          title: "Aucun canal configuré",
+          description: "Veuillez d'abord configurer des canaux Teams dans les paramètres.",
+          variant: "destructive"
+        });
+        setShowTeamsModal(false);
+      }
+    } catch (error) {
+      console.error('Erreur chargement canaux:', error);
       toast({
-        title: "🚨 Alerte envoyée !",
-        description: data.message || "L'alerte a été envoyée avec succès.",
+        title: "Erreur",
+        description: "Impossible de charger les canaux Teams.",
+        variant: "destructive"
+      });
+      setShowTeamsModal(false);
+    } finally {
+      setIsLoadingChannels(false);
+    }
+  }, [toast]);
+
+  // ✅ CORRIGÉ: Envoyer à un canal spécifique via SDK
+  const handleSendToChannel = React.useCallback(async (channelId, channelName) => {
+    setIsSendingToTeams(true);
+    
+    try {
+      const { data } = await base44.functions.invoke('sendToTeamsChannel', { 
+        articleId: article.id,
+        channelId: channelId
+      });
+      
+      toast({
+        title: "📨 Alerte envoyée !",
+        description: data.message || `Message envoyé au canal "${channelName}"`,
         duration: 5000
       });
+      
+      setShowTeamsModal(false);
     } catch (error) {
-      console.error('Erreur envoi alerte:', error);
+      console.error('Erreur envoi Teams:', error);
       toast({
-        title: "Erreur d'alerte",
+        title: "Erreur",
         description: error.response?.data?.error || "Impossible d'envoyer l'alerte.",
         variant: "destructive"
       });
     } finally {
-      setIsSendingAlert(false);
+      setIsSendingToTeams(false);
     }
-  }, [article.id, isSendingAlert, toast]);
+  }, [article.id, toast]);
 
   const handleDelete = React.useCallback(async () => {
     if (window.confirm("Voulez-vous vraiment supprimer cet article ? Cette action est irréversible.")) {
@@ -247,11 +294,8 @@ export default function ArticleCard({
     articleCategories[0] !== 'Aucune catégorie détectée' && 
     articleCategories[0] !== 'AssembleeNationale';
   
-  // Vérifier si des mots-clés sont disponibles
   const hasKeywords = article.detected_keywords && Array.isArray(article.detected_keywords) && article.detected_keywords.length > 0;
   
-  // console.log('Article:', article.title.substring(0, 30), 'Keywords:', hasKeywords, article.detected_keywords); // Kept for debugging if needed
-
   return (
     <>
       <div className="relative">
@@ -384,22 +428,21 @@ export default function ArticleCard({
                           </Button>
                         )}
 
-                        {/* Bouton ALERTES direct */}
+                        {/* MODIFIÉ: Bouton ALERTES ouvre un modal */}
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={(e) => { 
-                            e.stopPropagation(); 
-                            handleSendAlert(); 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleOpenTeamsModal();
                           }}
-                          disabled={isSendingAlert}
+                          disabled={isSendingToTeams || isLoadingChannels}
                           className="text-xs h-6 px-2 bg-red-50 border-red-200 text-red-700 hover:bg-red-100 transition-colors"
-                          aria-label="Envoyer une alerte"
                         >
-                          {isSendingAlert ? (
+                          {isLoadingChannels ? (
                             <>
                               <Loader2 className="w-3 h-3 mr-1 animate-spin" />
-                              Envoi...
+                              Chargement...
                             </>
                           ) : (
                             <>
@@ -434,7 +477,7 @@ export default function ArticleCard({
                           )}
                         </Button>
 
-                        {/* NOUVEAU: Bouton supprimer */}
+                        {/* Bouton supprimer */}
                         {onDelete && (
                           <Button
                             variant="ghost"
@@ -491,6 +534,68 @@ export default function ArticleCard({
           keywords={article.detected_keywords || []}
         />
       )}
+
+      {/* NOUVEAU: Modal de sélection de canal Teams */}
+      <Dialog open={showTeamsModal} onOpenChange={setShowTeamsModal}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5 text-red-600" />
+              Envoyer une alerte Teams
+            </DialogTitle>
+            <DialogDescription>
+              Sélectionnez le canal Teams où envoyer cet article
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3 max-h-96 overflow-y-auto py-4">
+            {isLoadingChannels ? (
+              <div className="text-center py-12">
+                <Loader2 className="w-8 h-8 animate-spin mx-auto text-blue-600 mb-3" />
+                <p className="text-sm text-gray-600">Chargement des canaux...</p>
+              </div>
+            ) : teamsChannels.length === 0 ? (
+              <div className="text-center py-12">
+                <AlertTriangle className="w-12 h-12 text-gray-400 mx-auto mb-3" />
+                <p className="text-gray-600 font-medium">Aucun canal configuré</p>
+                <p className="text-xs text-gray-500 mt-1">
+                  Configurez des canaux Teams dans les paramètres
+                </p>
+              </div>
+            ) : (
+              teamsChannels.map(channel => (
+                <button
+                  key={channel.id}
+                  onClick={() => handleSendToChannel(channel.id, channel.name)}
+                  disabled={isSendingToTeams}
+                  className="w-full text-left p-4 rounded-lg border-2 border-gray-200 hover:border-red-500 hover:bg-red-50 transition-all disabled:opacity-50 disabled:cursor-not-allowed group"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-lg bg-red-100 flex items-center justify-center flex-shrink-0 group-hover:bg-red-200 transition-colors">
+                      <AlertTriangle className="w-5 h-5 text-red-600" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-semibold text-gray-900">{channel.name}</p>
+                      {channel.description && (
+                        <p className="text-xs text-gray-600 truncate">{channel.description}</p>
+                      )}
+                    </div>
+                    {isSendingToTeams && (
+                      <Loader2 className="w-4 h-4 animate-spin text-red-600" />
+                    )}
+                  </div>
+                </button>
+              ))
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowTeamsModal(false)}>
+              Annuler
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

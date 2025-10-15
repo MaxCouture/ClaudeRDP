@@ -28,6 +28,8 @@ import UploadDeputePhotos from "./UploadDeputePhotos";
 
 import StabilityTests from "./StabilityTests";
 
+import TeamsChannels from "./TeamsChannels";
+
 import { BrowserRouter as Router, Route, Routes, useLocation } from 'react-router-dom';
 
 const PAGES = {
@@ -59,6 +61,8 @@ const PAGES = {
     UploadDeputePhotos: UploadDeputePhotos,
     
     StabilityTests: StabilityTests,
+    
+    TeamsChannels: TeamsChannels,
     
 }
 
@@ -114,6 +118,8 @@ function PagesContent() {
                 <Route path="/UploadDeputePhotos" element={<UploadDeputePhotos />} />
                 
                 <Route path="/StabilityTests" element={<StabilityTests />} />
+                
+                <Route path="/TeamsChannels" element={<TeamsChannels />} />
                 
             </Routes>
         </Layout>
